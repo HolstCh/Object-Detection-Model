@@ -32,6 +32,16 @@ combined_view = final_view.match(
 # use 4000 samples
 view = combined_view.limit(4000)
 
+# split the dataset into train, val, test
+splits = view.split(
+    {"train": 0.8, "val": 0.1, "test": 0.1},
+    shuffle=True,
+    seed=42,
+)
+train_view = splits["train"]
+val_view = splits["val"]
+test_view = splits["test"]
+
 # augment both "person" and "car" samples (make sure boundary box is encoded for transformations)
 # (x,y) top left encode to become -> (x,y) bottom right using imgaug
 augmenter = iaa.Sequential([
@@ -203,3 +213,4 @@ balanced_dataset.add_samples(augmented_car_samples)
 # launch app with the combined dataset (original and augmented samples)
 session = fo.launch_app(balanced_dataset, port=5152)
 session.wait()
+
