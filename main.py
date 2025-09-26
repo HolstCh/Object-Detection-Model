@@ -7,9 +7,16 @@ import numpy as np
 import os
 import json
 from imgaug.augmentables.bbs import BoundingBox, BoundingBoxesOnImage
+import random
+import gc
 
-# load the dataset
-dataset = foz.load_zoo_dataset(
+SEED = 42
+VAL_COUNT = 500
+TEST_COUNT = 500
+BOTH_TOTAL_TARGET = 369
+
+# load the train dataset
+train_dataset = foz.load_zoo_dataset(
     "coco-2017",
     split="train",
     label_types=["detections"],
@@ -18,7 +25,7 @@ dataset = foz.load_zoo_dataset(
 )
 
 # filter the dataset to keep only "person" or "car" labels
-filtered_view = dataset.filter_labels("ground_truth", F("label").is_in(["person", "car"]))
+filtered_view = train_dataset.filter_labels("ground_truth", F("label").is_in(["person", "car"]))
 
 # further filter to include only samples that have at least one "person" or "car" detection
 final_view = filtered_view.match(F("ground_truth.detections").length() > 0)
@@ -32,24 +39,89 @@ combined_view = final_view.match(
 # use 4000 samples
 view = combined_view.limit(4000)
 
-# split the dataset into train, val, test
-splits = view.split(
-    {"train": 0.8, "val": 0.1, "test": 0.1},
-    shuffle=True,
-    seed=42,
+# --- VAL/TEST (modified logic) ---
+val_ds = foz.load_zoo_dataset(
+    "coco-2017",
+    split="validation",
+    label_types=["detections"],
+    classes=["person", "car"],
 )
-train_view = splits["train"]
-val_view = splits["val"]
-test_view = splits["test"]
+val_filtered = val_ds.filter_labels("ground_truth", F("label").is_in(["person", "car"]))
+
+both_view = val_filtered.match(
+    (F("ground_truth.detections").filter(F("label") == "person").length() > 0) &
+    (F("ground_truth.detections").filter(F("label") == "car").length() > 0)
+)
+person_only_view = val_filtered.match(
+    (F("ground_truth.detections").filter(F("label") == "person").length() > 0) &
+    (F("ground_truth.detections").filter(F("label") == "car").length() == 0)
+)
+car_only_view = val_filtered.match(
+    (F("ground_truth.detections").filter(F("label") == "car").length() > 0) &
+    (F("ground_truth.detections").filter(F("label") == "person").length() == 0)
+)
+
+rng = random.Random(SEED)
+both_ids = list(both_view.values("id"))
+person_only_ids = list(person_only_view.values("id"))
+car_only_ids = list(car_only_view.values("id"))
+single_ids = person_only_ids + car_only_ids
+
+rng.shuffle(both_ids)
+rng.shuffle(single_ids)
+
+need_val = VAL_COUNT
+need_test = TEST_COUNT
+need_total = need_val + need_test
+
+desired_both_total = min(BOTH_TOTAL_TARGET, len(both_ids), need_total)
+val_both_target = min(desired_both_total // 2 + desired_both_total % 2, need_val)
+test_both_target = desired_both_total - val_both_target
+
+val_both_ids = both_ids[:val_both_target]
+test_both_ids = both_ids[val_both_target:val_both_target + test_both_target]
+
+remaining_val = need_val - len(val_both_ids)
+remaining_test = need_test - len(test_both_ids)
+
+if len(single_ids) < (remaining_val + remaining_test):
+    raise ValueError(f"Not enough single-class images to fill: need {remaining_val + remaining_test}, have {len(single_ids)}")
+
+val_single_ids = single_ids[:remaining_val]
+test_single_ids = single_ids[remaining_val:remaining_val + remaining_test]
+
+val_ids = val_both_ids + val_single_ids
+test_ids = test_both_ids + test_single_ids
+
+# safety uniqueness
+val_set = set(val_ids)
+test_ids = [i for i in test_ids if i not in val_set][:need_test]
+
+assert len(val_ids) == need_val
+assert len(test_ids) == need_test
+assert not (set(val_ids) & set(test_ids))
+
+val_view = val_filtered.select(val_ids)
+test_view = val_filtered.select(test_ids)
+
+print(f"[info] val: total={len(val_view)} both={len(val_both_ids)} single={len(val_single_ids)}")
+print(f"[info] test: total={len(test_view)} both={len(test_both_ids)} single={len(test_single_ids)}")
+
+
+# tag splits (added)
+for s in view: s.tags.append("train")
+for s in val_view: s.tags.append("val")
+for s in test_view: s.tags.append("test")
+train_dataset.save()
+val_ds.save()
 
 # augment both "person" and "car" samples (make sure boundary box is encoded for transformations)
 # (x,y) top left encode to become -> (x,y) bottom right using imgaug
-augmenter = iaa.Sequential([
-    iaa.Affine(rotate=(-15, 15)),  # random rotation between -15 and 15 degrees
-    iaa.Multiply((0.8, 1.2)),  # random brightness adjustment
-    iaa.AdditiveGaussianNoise(scale=(0, 0.05*255)),  # random Gaussian noise
+AUGMENTER = iaa.Sequential([
+    iaa.Affine(rotate=(-15, 15)),
+    iaa.Multiply((0.8, 1.2)),
+    iaa.AdditiveGaussianNoise(scale=(0, 0.05 * 255)),
 ])
-
 augmented_dir = "augmented_samples"
 os.makedirs(augmented_dir, exist_ok=True)
 
@@ -126,18 +198,7 @@ def augment_samples_with_bboxes(view, label, augmented_dir, num_samples=200, aug
         # apply augmentations
         for i in range(augmentations_per_sample):
             try:
-                augmenter = iaa.Sequential([
-                    iaa.Affine(rotate=(-15, 15)),  # random rotation between -15 and 15 degrees
-                    iaa.Multiply((0.8, 1.2)),  # random brightness adjustment
-                    iaa.AdditiveGaussianNoise(scale=(0, 0.05 * 255)),  # random Gaussian noise
-                ])
-
-                # apply augmentations to image and bounding boxes
-                # print(bbs_on_image)
-                augmented = augmenter(image=img_array, bounding_boxes=bbs_on_image)
-                aug_img = augmented[0]
-                aug_bbs = augmented[1]
-
+                aug_img, aug_bbs = AUGMENTER(image=img_array, bounding_boxes=bbs_on_image)
                 # save augmented image offline if required
                 aug_filepath = os.path.join(augmented_dir, f"{sample.id}_{label}_aug_{i}.jpg")
                 if not online:
@@ -190,6 +251,9 @@ def augment_samples_with_bboxes(view, label, augmented_dir, num_samples=200, aug
             except Exception as e:
                 print(f"Error augmenting sample {sample.id}: {e}")
 
+        del img_array
+        gc.collect()
+
     return augmented_samples
 
 # augment samples with bounding boxes for "person" and "car"
@@ -200,17 +264,31 @@ os.makedirs(augmented_dir, exist_ok=True)
 augmented_person_samples = augment_samples_with_bboxes(view, "person", augmented_dir)
 augmented_car_samples = augment_samples_with_bboxes(view, "car", augmented_dir)
 
-# create a new dataset to hold the balanced and augmented samples
-balanced_dataset = fo.Dataset()
+# # create a new dataset to hold the balanced and augmented samples
+# balanced_dataset = fo.Dataset()
+#
+# # add augmented samples
+# balanced_dataset.add_samples(augmented_person_samples)
+# balanced_dataset.add_samples(augmented_car_samples)
+#
+# # launch app with the combined dataset (original and augmented samples)
+# session = fo.launch_app(balanced_dataset, port=5152)
+# session.wait()
 
-# add original balanced samples
-balanced_dataset.add_samples(list(view))
+try:
+    fo.close_app()
+except Exception:
+    pass
 
-# add augmented samples
+# --- changed: build final dataset including originals + val + test + augmented ---
+if "person_car_final" in fo.list_datasets():
+    fo.delete_dataset("person_car_final")
+balanced_dataset = fo.Dataset(name="person_car_final")
+balanced_dataset.add_samples(list(view))        # train originals
+balanced_dataset.add_samples(list(val_view))    # validation
+balanced_dataset.add_samples(list(test_view))   # test
 balanced_dataset.add_samples(augmented_person_samples)
 balanced_dataset.add_samples(augmented_car_samples)
 
-# launch app with the combined dataset (original and augmented samples)
-session = fo.launch_app(balanced_dataset, port=5152)
-session.wait()
+session = fo.launch_app(balanced_dataset, port=None, address="127.0.0.1", remote=False)
 
