@@ -9,6 +9,8 @@ import json
 from imgaug.augmentables.bbs import BoundingBox, BoundingBoxesOnImage
 import random
 import gc
+from export_to_yolo import export_to_yolo
+import fiftyone.types as types
 
 SEED = 42
 VAL_COUNT = 500
@@ -39,7 +41,6 @@ combined_view = final_view.match(
 # use 4000 samples
 view = combined_view.limit(4000)
 
-# --- VAL/TEST (modified logic) ---
 val_ds = foz.load_zoo_dataset(
     "coco-2017",
     split="validation",
@@ -107,13 +108,10 @@ test_view = val_filtered.select(test_ids)
 print(f"[info] val: total={len(val_view)} both={len(val_both_ids)} single={len(val_single_ids)}")
 print(f"[info] test: total={len(test_view)} both={len(test_both_ids)} single={len(test_single_ids)}")
 
-
-# tag splits (added)
-for s in view: s.tags.append("train")
-for s in val_view: s.tags.append("val")
-for s in test_view: s.tags.append("test")
-train_dataset.save()
-val_ds.save()
+# tag splits persistently using views (previous calls caused TypeError)
+view.tag_samples("train")
+val_view.tag_samples("val")
+test_view.tag_samples("test")
 
 # augment both "person" and "car" samples (make sure boundary box is encoded for transformations)
 # (x,y) top left encode to become -> (x,y) bottom right using imgaug
@@ -222,17 +220,10 @@ def augment_samples_with_bboxes(view, label, augmented_dir, num_samples=200, aug
                 # create a new sample for the augmented image
                 aug_sample = fo.Sample(filepath=aug_filepath if not online else None)
                 aug_sample["ground_truth"] = sample["ground_truth"].copy()
-                aug_sample["tags"] = ["augmented"]
+                aug_sample.tags = list(dict.fromkeys(sample.tags + ["augmented"]))  # inherit + add augmented
 
                 # update bounding boxes in the augmented sample
                 for det, aug_bbox in zip(aug_sample["ground_truth"].detections, aug_bbs.bounding_boxes):
-                    # x1, y1 = aug_bbox.x1, aug_bbox.y1
-                    # x2, y2 = aug_bbox.x2, aug_bbox.y2
-                    # width = aug_bbox.x2 - aug_bbox.x1  # calculate width
-                    # height = aug_bbox.y2 - aug_bbox.y1  # calculate height
-                    # x2 = x1 + width  # add width to x1
-                    # y2 = y1 + height  # add height to y1
-
                     # convert (x1, y1, x2, y2) to normalized coordinates (x, y, w, h) for FiftyOne
                     x1, y1 = aug_bbox.x1, aug_bbox.y1
                     x2, y2 = aug_bbox.x2, aug_bbox.y2
@@ -264,31 +255,28 @@ os.makedirs(augmented_dir, exist_ok=True)
 augmented_person_samples = augment_samples_with_bboxes(view, "person", augmented_dir)
 augmented_car_samples = augment_samples_with_bboxes(view, "car", augmented_dir)
 
-# # create a new dataset to hold the balanced and augmented samples
-# balanced_dataset = fo.Dataset()
-#
-# # add augmented samples
-# balanced_dataset.add_samples(augmented_person_samples)
-# balanced_dataset.add_samples(augmented_car_samples)
-#
-# # launch app with the combined dataset (original and augmented samples)
-# session = fo.launch_app(balanced_dataset, port=5152)
-# session.wait()
-
-try:
-    fo.close_app()
-except Exception:
-    pass
-
-# --- changed: build final dataset including originals + val + test + augmented ---
-if "person_car_final" in fo.list_datasets():
-    fo.delete_dataset("person_car_final")
 balanced_dataset = fo.Dataset(name="person_car_final")
-balanced_dataset.add_samples(list(view))        # train originals
-balanced_dataset.add_samples(list(val_view))    # validation
-balanced_dataset.add_samples(list(test_view))   # test
+balanced_dataset.add_samples(list(view))
+balanced_dataset.add_samples(list(val_view))
+balanced_dataset.add_samples(list(test_view))
 balanced_dataset.add_samples(augmented_person_samples)
 balanced_dataset.add_samples(augmented_car_samples)
 
-session = fo.launch_app(balanced_dataset, port=None, address="127.0.0.1", remote=False)
+print("[info] counts after building balanced dataset:")
+print("  train:", balanced_dataset.match_tags("train").count())
+print("  val:", balanced_dataset.match_tags("val").count())
+print("  test:", balanced_dataset.match_tags("test").count())
+print("  augmented:", balanced_dataset.match_tags("augmented").count())
 
+# export all distinct tags (train/val/test/augmented) to YOLO
+all_tags = balanced_dataset.distinct("tags")
+print(f"[info] exporting tags -> {all_tags}")
+export_to_yolo(
+    dataset_name="person_car_final",
+    label_field="ground_truth",
+    export_dir="yolo_export",
+    classes=["person", "car"],
+    splits=all_tags,
+    overwrite=True,
+)
+print("[info] export complete to yolo_export/")
