@@ -16,6 +16,7 @@ SEED = 42
 VAL_COUNT = 500
 TEST_COUNT = 500
 BOTH_TOTAL_TARGET = 369
+TRAIN_TARGET = 5000  # desired final train count (including augmented)
 
 # load the train dataset
 train_dataset = foz.load_zoo_dataset(
@@ -255,28 +256,43 @@ os.makedirs(augmented_dir, exist_ok=True)
 augmented_person_samples = augment_samples_with_bboxes(view, "person", augmented_dir)
 augmented_car_samples = augment_samples_with_bboxes(view, "car", augmented_dir)
 
+# select only needed augmented samples to reach TRAIN_TARGET
+base_train_count = view.count()
+augmented_all = augmented_person_samples + augmented_car_samples
+needed_aug = max(0, TRAIN_TARGET - base_train_count)
+if needed_aug == 0:
+    selected_augmented = []
+    print(f"[info] train already at target {TRAIN_TARGET} without augmentation")
+else:
+    if needed_aug > len(augmented_all):
+        print(f"[warn] not enough augmented samples to reach {TRAIN_TARGET}; have {len(augmented_all)} need {needed_aug}")
+        selected_augmented = augmented_all
+    else:
+        # deterministic selection
+        random.Random(SEED).shuffle(augmented_all)
+        selected_augmented = augmented_all[:needed_aug]
+    print(f"[info] using {len(selected_augmented)} augmented samples to reach train target {TRAIN_TARGET}")
+
 balanced_dataset = fo.Dataset(name="person_car_final")
 balanced_dataset.add_samples(list(view))
 balanced_dataset.add_samples(list(val_view))
 balanced_dataset.add_samples(list(test_view))
-balanced_dataset.add_samples(augmented_person_samples)
-balanced_dataset.add_samples(augmented_car_samples)
+balanced_dataset.add_samples(selected_augmented)  # only selected augmented samples
 
 print("[info] counts after building balanced dataset:")
 print("  train:", balanced_dataset.match_tags("train").count())
 print("  val:", balanced_dataset.match_tags("val").count())
 print("  test:", balanced_dataset.match_tags("test").count())
-print("  augmented:", balanced_dataset.match_tags("augmented").count())
+print("  augmented (subset of train):", balanced_dataset.match_tags("augmented").count())
 
-# export all distinct tags (train/val/test/augmented) to YOLO
-all_tags = balanced_dataset.distinct("tags")
-print(f"[info] exporting tags -> {all_tags}")
+# export only train/val/test splits
+print(f"[info] exporting splits -> ['train','val','test']")
 export_to_yolo(
     dataset_name="person_car_final",
     label_field="ground_truth",
     export_dir="yolo_export",
     classes=["person", "car"],
-    splits=all_tags,
+    splits=["train", "val", "test"],
     overwrite=True,
 )
 print("[info] export complete to yolo_export/")
