@@ -17,6 +17,7 @@ VAL_COUNT = 500
 TEST_COUNT = 500
 BOTH_TOTAL_TARGET = 369
 TRAIN_TARGET = 5000  # desired final train count (including augmented)
+EXPORT_FORMAT =  "coco"
 
 # load the train dataset
 train_dataset = foz.load_zoo_dataset(
@@ -285,14 +286,37 @@ print("  val:", balanced_dataset.match_tags("val").count())
 print("  test:", balanced_dataset.match_tags("test").count())
 print("  augmented (subset of train):", balanced_dataset.match_tags("augmented").count())
 
-# export only train/val/test splits
-print(f"[info] exporting splits -> ['train','val','test']")
-export_to_yolo(
-    dataset_name="person_car_final",
-    label_field="ground_truth",
-    export_dir="yolo_export",
-    classes=["person", "car"],
-    splits=["train", "val", "test"],
-    overwrite=True,
-)
-print("[info] export complete to yolo_export/")
+# Export in requested format
+if EXPORT_FORMAT == "coco":
+    export_dir = "coco_export"
+    os.makedirs(export_dir, exist_ok=True)
+    print(f"[info] exporting COCO splits -> ['train','val','test'] to {export_dir}/")
+    for split in ["train", "val", "test"]:
+        view_split = balanced_dataset.match_tags(split)
+        if view_split.count() == 0:
+            print(f"[warn] no samples for split '{split}', skipping COCO export")
+            continue
+        split_dir = os.path.join(export_dir, split)
+        # COCO exporter will create annotations.json and copy images
+        view_split.export(
+            export_dir=split_dir,
+            dataset_type=types.COCODetectionDataset,
+            label_field="ground_truth",
+            classes=["person", "car"],
+            overwrite=True,
+        )
+        print(f"[info] COCO '{split}' -> {split_dir}/")
+    print(f"[info] COCO export complete: {export_dir}/")
+elif EXPORT_FORMAT == "yolo":
+    print(f"[info] exporting YOLO splits -> ['train','val','test']")
+    export_to_yolo(
+        dataset_name="person_car_final",
+        label_field="ground_truth",
+        export_dir="yolo_export",
+        classes=["person", "car"],
+        splits=["train", "val", "test"],
+        overwrite=True,
+    )
+    print("[info] YOLO export complete to yolo_export/")
+else:
+    print(f"[error] unknown EXPORT_FORMAT='{EXPORT_FORMAT}'. Use 'coco' or 'yolo'.")
